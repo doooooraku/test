@@ -14,6 +14,7 @@ from __future__ import annotations
 import os, re, sys, shutil, argparse, logging, hashlib
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
+from dataclasses import dataclass
 
 try:
     import pandas as pd
@@ -26,6 +27,16 @@ except Exception:
     openpyxl = None
 
 VALID_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+
+
+@dataclass
+class SortStats:
+    moved: int = 0
+    copied: int = 0
+    skipped_unmatched: int = 0
+    skipped_small: int = 0
+    skipped_conflict: int = 0
+    skipped_hash_dup: int = 0
 
 def normalize_filename(name: str) -> str:
     name = name.replace("＿", "_").replace("·", "").replace("・", "")
@@ -241,6 +252,119 @@ def build_category_from_excel_row(row: "pd.Series") -> Dict[str,str]:
             cats[k] = ""
     return cats
 
+
+def process_file(
+    f: Path,
+    root: Path,
+    mode: str,
+    args,
+    row_map: Dict[str, Dict[str, str]],
+    logger: logging.Logger,
+    moved_records: List[Path],
+    stats: SortStats,
+) -> None:
+    size = f.stat().st_size
+    if size < max(0, int(args.min_bytes)):
+        logger.warning("小さすぎるためスキップ(%d bytes): %s", size, f)
+        stats.skipped_small += 1
+        return
+
+    parsed = parse_filename(f.name)
+    if not parsed:
+        logger.warning("命名規則に一致しないためスキップ: %s", f.name)
+        stats.skipped_unmatched += 1
+        return
+
+    date, content0, char0, face0, middle, num, ext = parsed
+
+    canonical = build_canonical_name(date, content0, char0, face0, middle, num, ext)
+    if canonical != f.name:
+        new_path = f.with_name(canonical)
+        if new_path.exists():
+            new_path = ensure_unique_path(new_path)
+        if not args.dry_run:
+            try:
+                f.rename(new_path)
+            except Exception as e:
+                logger.error("   リネーム失敗: %s -> %s (%s)", f.name, new_path.name, e)
+            f = new_path
+        else:
+            logger.info("   正規名へリネーム予定: %s -> %s", f.name, new_path.name)
+            f = new_path
+
+    stem = f.stem
+    cats = None
+    if row_map:
+        cats = row_map.get(stem)
+        if not cats:
+            for k, v in row_map.items():
+                if stem.startswith(k):
+                    cats = v
+                    break
+    if cats is None:
+        cats = {
+            "content": content0,
+            "character": char0,
+            "face": face0,
+            "body": middle,
+            "backg": "",
+            "photo": "",
+            "light": "",
+        }
+        logger.info("   Excel未一致のためファイル名からカテゴリを使用: %s", f.name)
+
+    parts: List[str] = [
+        mode,
+        cats["content"],
+        cats["character"],
+        cats["face"],
+        cats["body"],
+        cats["backg"],
+        cats["photo"],
+        cats["light"],
+        date,
+    ]
+    parts = [p for p in parts if p]
+    dest_dir = safe_join(root, *parts)
+    if args.batch:
+        dest_dir = dest_dir / args.batch
+    dest_path = dest_dir / f.name
+
+    logger.info("→ %s  ->  %s", f, dest_path.relative_to(root))
+    if args.dry_run:
+        return
+
+    try:
+        if args.on_conflict == "hash":
+            digest = sha1sum(f)
+            same = find_same_hash(dest_dir, digest)
+            if same:
+                logger.info("   内容重複のためスキップ（hash-dup）: %s == %s", f.name, same.name)
+                stats.skipped_hash_dup += 1
+                return
+
+        final_path = dest_path
+        if dest_path.exists():
+            if args.on_conflict == "skip":
+                logger.info("   既存のためスキップ（skip）: %s", dest_path.relative_to(root))
+                stats.skipped_conflict += 1
+                return
+            elif args.on_conflict == "overwrite":
+                logger.info("   既存を削除（overwrite）: %s", dest_path.relative_to(root))
+                dest_path.unlink()
+            else:
+                final_path = ensure_unique_path(dest_path)
+
+        final_path = move_or_copy(f, final_path, copy=args.copy)
+        moved_records.append(final_path)
+        if args.copy:
+            stats.copied += 1
+        else:
+            stats.moved += 1
+        logger.info("   完了: %s", final_path.relative_to(root))
+    except Exception as e:
+        logger.error("   失敗: %s (%s)", f, e)
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="フォルダ仕分け v1.10（背景→写真の順・ポーズ列は無視）")
     ap.add_argument("--src", type=str, help="画像が置かれているフォルダ（省略可。未指定なら対話）")
@@ -314,97 +438,11 @@ def main(argv=None) -> int:
             if not key: continue
             row_map[key] = build_category_from_excel_row(row)
 
-    moved=copied=skipped_unmatched=skipped_small=skipped_conflict=skipped_hash_dup=overwritten=dupped=0
+    stats = SortStats()
     moved_records: List[Path] = []
 
     for f in sorted(files):
-        size = f.stat().st_size
-        if size < max(0, int(args.min_bytes)):
-            logger.warning("小さすぎるためスキップ(%d bytes): %s", size, f)
-            skipped_small += 1; continue
-
-        parsed = parse_filename(f.name)
-        if not parsed:
-            logger.warning("命名規則に一致しないためスキップ: %s", f.name)
-            skipped_unmatched += 1; continue
-
-        date, content0, char0, face0, middle, num, ext = parsed
-
-        # 正規名に統一（2連番と末尾_を除去）
-        canonical = build_canonical_name(date, content0, char0, face0, middle, num, ext)
-        if canonical != f.name:
-            new_path = f.with_name(canonical)
-            if new_path.exists():
-                new_path = ensure_unique_path(new_path)
-            if not args.dry_run:
-                try:
-                    f.rename(new_path)
-                except Exception as e:
-                    logger.error("   リネーム失敗: %s -> %s (%s)", f.name, new_path.name, e)
-                f = new_path
-            else:
-                logger.info("   正規名へリネーム予定: %s -> %s", f.name, new_path.name)
-                f = new_path
-
-        # Excel からカテゴリ取得（なければファイル名の値を使用）
-        stem = f.stem
-        cats = None
-        if row_map:
-            cats = row_map.get(stem)
-            if not cats:
-                for k, v in row_map.items():
-                    if stem.startswith(k):
-                        cats = v; break
-        if cats is None:
-            cats = {
-                "content": content0,
-                "character": char0,
-                "face": face0,
-                "body": middle,  # Excel未一致時のみ middle を body として使用
-                "backg": "",
-                "photo": "",
-                "light": "",
-            }
-            logger.info("   Excel未一致のためファイル名からカテゴリを使用: %s", f.name)
-
-        # <<< フォルダ順を body -> backg -> photo -> light に変更 >>>
-        parts: List[str] = [mode, cats["content"], cats["character"], cats["face"], cats["body"], cats["backg"], cats["photo"], cats["light"], date]
-        parts = [p for p in parts if p]  # 空はスキップ
-
-        dest_dir = safe_join(root, *parts)
-        if args.batch:
-            dest_dir = dest_dir / args.batch
-        dest_path = dest_dir / f.name
-
-        logger.info("→ %s  ->  %s", f, dest_path.relative_to(root))
-        if args.dry_run: continue
-
-        try:
-            if args.on_conflict == "hash":
-                digest = sha1sum(f)
-                same = find_same_hash(dest_dir, digest)
-                if same:
-                    logger.info("   内容重複のためスキップ（hash-dup）: %s == %s", f.name, same.name)
-                    skipped_hash_dup += 1; continue
-
-            final_path = dest_path
-            if dest_path.exists():
-                if args.on_conflict == "skip":
-                    logger.info("   既存のためスキップ（skip）: %s", dest_path.relative_to(root))
-                    skipped_conflict += 1; continue
-                elif args.on_conflict == "overwrite":
-                    logger.info("   既存を削除（overwrite）: %s", dest_path.relative_to(root))
-                    dest_path.unlink()
-                else:
-                    final_path = ensure_unique_path(dest_path)
-
-            final_path = move_or_copy(f, final_path, copy=args.copy)
-            moved_records.append(final_path)
-            if args.copy: copied += 1
-            else: moved += 1
-            logger.info("   完了: %s", final_path.relative_to(root))
-        except Exception as e:
-            logger.error("   失敗: %s (%s)", f, e)
+        process_file(f, root, mode, args, row_map, logger, moved_records, stats)
 
     # Excel/CSV 更新（本番のみ）
     out_path = None
@@ -446,10 +484,17 @@ def main(argv=None) -> int:
             logger.error("Excel/CSV の保存に失敗: %s (%s)", out_path, e)
 
     logger.info("=== サマリ ===")
-    logger.info("moved: %d / copied: %d", moved, copied)
-    logger.info("skipped_unmatched: %d  skipped_small: %d", skipped_unmatched, skipped_small)
-    logger.info("skipped_conflict: %d  skipped_hash_dup: %d", skipped_conflict, skipped_hash_dup)
-    logger.info("overwritten: %d  dupped: %d", overwritten, dupped)
+    logger.info("moved: %d / copied: %d", stats.moved, stats.copied)
+    logger.info(
+        "skipped_unmatched: %d  skipped_small: %d",
+        stats.skipped_unmatched,
+        stats.skipped_small,
+    )
+    logger.info(
+        "skipped_conflict: %d  skipped_hash_dup: %d",
+        stats.skipped_conflict,
+        stats.skipped_hash_dup,
+    )
     if out_path:
         logger.info("追記保存ファイル: %s", out_path)
     logger.info("ログ: %s", log_path)
